@@ -248,33 +248,48 @@ type clusterServiceMap struct {
 }
 
 func getServiceMaps(clients []*namedClient, ctx context.Context) ([]clusterServiceMap, error) {
-	var results []clusterServiceMap
+	results := make([]clusterServiceMap, 0, len(clients))
 
-	for _, nc := range clients {
-		servicesMap := make(map[string][]internal.Service)
-
-		nodes, err := nc.client.GetNodes(ctx)
+	for i := 0; i < len(clients); i++ {
+		csm, err := getServiceMapForClient(clients[i], ctx)
 		if err != nil {
-			log.Printf("Error scanning nodes for %q: %v", nc.name, err)
+			log.Printf("Error scanning nodes for %q: %v", clients[i].name, err)
 			continue
 		}
-
-		for _, nodeStatus := range nodes {
-			services, err := scanServices(nc.client, ctx, nodeStatus.Node)
-			if err != nil {
-				log.Printf("Error scanning services on node %s (%s): %v", nodeStatus.Node, nc.name, err)
-				continue
-			}
-			servicesMap[nodeStatus.Node] = services
-		}
-
-		results = append(results, clusterServiceMap{
-			clusterName: nc.name,
-			services:    servicesMap,
-		})
+		results = append(results, csm)
 	}
 
 	return results, nil
+}
+
+// getServiceMapForClient queries a single Proxmox endpoint and returns a
+// clusterServiceMap. Extracted into its own function to guarantee clean
+// variable scoping under yaegi (Traefik's Go interpreter).
+func getServiceMapForClient(nc *namedClient, ctx context.Context) (clusterServiceMap, error) {
+	servicesMap := make(map[string][]internal.Service)
+
+	nodes, err := nc.client.GetNodes(ctx)
+	if err != nil {
+		return clusterServiceMap{}, err
+	}
+
+	totalServices := 0
+	for _, nodeStatus := range nodes {
+		services, err := scanServices(nc.client, ctx, nodeStatus.Node)
+		if err != nil {
+			log.Printf("Error scanning services on node %s (%s): %v", nodeStatus.Node, nc.name, err)
+			continue
+		}
+		servicesMap[nodeStatus.Node] = services
+		totalServices += len(services)
+	}
+
+	log.Printf("Discovered %d service(s) across %d node(s) for %q", totalServices, len(nodes), nc.name)
+
+	return clusterServiceMap{
+		clusterName: nc.name,
+		services:    servicesMap,
+	}, nil
 }
 
 func getIPsOfService(client *internal.ProxmoxClient, ctx context.Context, nodeName string, vmID uint64, isContainer bool) (ips []internal.IP, err error) {
@@ -309,7 +324,12 @@ func getIPsOfService(client *internal.ProxmoxClient, ctx context.Context, nodeNa
 	return filteredIPs, nil
 }
 
-func scanServices(client *internal.ProxmoxClient, ctx context.Context, nodeName string) (services []internal.Service, err error) {
+func scanServices(client *internal.ProxmoxClient, ctx context.Context, nodeName string) ([]internal.Service, error) {
+	// Use an explicit local slice instead of a named return value.
+	// Yaegi (Traefik's Go interpreter) can fail to re-initialize named
+	// return variables between calls, causing results to accumulate.
+	services := make([]internal.Service, 0)
+
 	// Scan virtual machines
 	vms, err := client.GetVirtualMachines(ctx, nodeName)
 	if err != nil {
@@ -320,21 +340,21 @@ func scanServices(client *internal.ProxmoxClient, ctx context.Context, nodeName 
 		if client.LogLevel == "debug" {
 			log.Printf("DEBUG: Scanning VM %s/%s (%d): %s", nodeName, vm.Name, vm.VMID, vm.Status)
 		}
-		
+
 		if vm.Status == "running" {
 			config, err := client.GetVMConfig(ctx, nodeName, vm.VMID)
 			if err != nil {
 				log.Printf("ERROR: Error getting VM config for %d: %v", vm.VMID, err)
 				continue
 			}
-			
+
 			traefikConfig := config.GetTraefikMap()
 			if client.LogLevel == "debug" {
 				log.Printf("VM %s (%d) traefik config: %v", vm.Name, vm.VMID, traefikConfig)
 			}
-			
+
 			service := internal.NewService(vm.VMID, vm.Name, traefikConfig)
-			
+
 			ips, err := getIPsOfService(client, ctx, nodeName, vm.VMID, false)
 			if err == nil {
 				service.IPs = ips
@@ -354,7 +374,6 @@ func scanServices(client *internal.ProxmoxClient, ctx context.Context, nodeName 
 		if client.LogLevel == "debug" {
 			log.Printf("DEBUG: Scanning container %s/%s (%d): %s", nodeName, ct.Name, ct.VMID, ct.Status)
 		}
-			
 
 		if ct.Status == "running" {
 			config, err := client.GetContainerConfig(ctx, nodeName, ct.VMID)
