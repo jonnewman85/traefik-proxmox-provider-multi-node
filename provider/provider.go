@@ -275,6 +275,13 @@ func getServiceMapForClient(nc *namedClient, ctx context.Context) (clusterServic
 
 	totalServices := 0
 	for _, nodeStatus := range nodes {
+		// Skip nodes that Proxmox reports as not online. Empty status falls
+		// through (treated as online) to preserve behavior on older Proxmox
+		// versions that may not return the field.
+		if nodeStatus.Status != "" && nodeStatus.Status != "online" {
+			log.Printf("Skipping node %s (%s): status=%s", nodeStatus.Node, nc.name, nodeStatus.Status)
+			continue
+		}
 		services, err := scanServices(nc.client, ctx, nodeStatus.Node)
 		if err != nil {
 			log.Printf("Error scanning services on node %s (%s): %v", nodeStatus.Node, nc.name, err)
@@ -488,11 +495,10 @@ func generateConfiguration(clusterMaps []clusterServiceMap, multiCluster bool) *
 					// Apply service options
 					applyServiceOptions(loadBalancer, service, serviceName)
 
-					// Add server URL(s)
-					serverURL := getServiceURL(service, serviceName, nodeName)
-					loadBalancer.Servers = append(loadBalancer.Servers, dynamic.Server{
-						URL: serverURL,
-					})
+					// Add one Server entry per discovered backend URL.
+					for _, u := range getServiceURLs(service, serviceName, nodeName) {
+						loadBalancer.Servers = append(loadBalancer.Servers, dynamic.Server{URL: u})
+					}
 
 					config.HTTP.Services[serviceName] = &dynamic.Service{
 						LoadBalancer: loadBalancer,
@@ -504,18 +510,26 @@ func generateConfiguration(clusterMaps []clusterServiceMap, multiCluster bool) *
 					// Get router rule
 					rule := getRouterRule(service, routerName)
 
-					// Find target service (prefer explicit mapping)
+					// Find target service. Prefer an explicit `…service=` mapping;
+					// otherwise prefer a service whose name matches the router,
+					// then fall back to the first discovered service name.
 					targetService := serviceNames[0]
+					for _, sn := range serviceNames {
+						if sn == routerName {
+							targetService = sn
+							break
+						}
+					}
 					serviceLabel := fmt.Sprintf("traefik.http.routers.%s.service", routerName)
 					if val, exists := service.Config[serviceLabel]; exists {
 						targetService = val
 					}
 
-					// Create basic router
+					// Leave Priority unset (zero) so Traefik applies its default
+					// rule-length-based ordering unless an explicit label is set.
 					router := &dynamic.Router{
-						Service:  targetService,
-						Rule:     rule,
-						Priority: 1, // Default priority
+						Service: targetService,
+						Rule:    rule,
 					}
 
 					// Apply additional router options from labels
@@ -575,19 +589,40 @@ func applyServiceOptions(lb *dynamic.ServersLoadBalancer, service internal.Servi
 	}
 	
 	// Handle HealthCheck
+	// https://doc.traefik.io/traefik/v3.7/reference/routing-configuration/http/load-balancing/service/#health-check
 	if healthcheckPath, exists := service.Config[prefix+".healthcheck.path"]; exists {
 		hc := &dynamic.ServerHealthCheck{
 			Path: healthcheckPath,
 		}
-		
+
 		if interval, exists := service.Config[prefix+".healthcheck.interval"]; exists {
 			hc.Interval = interval
 		}
-		
+
 		if timeout, exists := service.Config[prefix+".healthcheck.timeout"]; exists {
 			hc.Timeout = timeout
 		}
-		
+
+		if scheme, exists := service.Config[prefix+".healthcheck.scheme"]; exists {
+			hc.Scheme = scheme
+		}
+
+		if port, exists := service.Config[prefix+".healthcheck.port"]; exists {
+			if val, err := stringToInt(port); err == nil {
+				hc.Port = val
+			}
+		}
+
+		if followRedirects, exists := service.Config[prefix+".healthcheck.followredirects"]; exists {
+			if val, err := stringToBool(followRedirects); err == nil {
+				hc.FollowRedirects = &val
+			}
+		}
+
+		if method, exists := service.Config[prefix+".healthcheck.method"]; exists {
+			hc.Method = method
+		}
+
 		lb.HealthCheck = hc
 	}
 	
@@ -627,6 +662,11 @@ func applyServiceOptions(lb *dynamic.ServersLoadBalancer, service internal.Servi
 	}
 }
 
+// tlsDomainPattern matches array-indexed TLS domain labels of the form
+// `…tls.domains[N].main` or `…tls.domains[N].sans`. Compiled once at package
+// init to avoid recompiling on every poll cycle.
+var tlsDomainPattern = regexp.MustCompile(`\.tls\.domains\[(\d+)\]\.(main|sans)$`)
+
 // Handle TLS configuration
 func handleRouterTLS(service internal.Service, prefix string) *dynamic.RouterTLSConfig {
 	tlsEnabled := false
@@ -641,10 +681,9 @@ func handleRouterTLS(service internal.Service, prefix string) *dynamic.RouterTLS
 	options, hasOptions := service.Config[prefix+".tls.options"]
 
 	// Check for array-indexed domains: tls.domains[N].main/sans
-	domainPattern := regexp.MustCompile(`\.tls\.domains\[(\d+)\]\.(main|sans)$`)
 	domainMap := make(map[int]*types.Domain)
 	for key, value := range service.Config {
-		if matches := domainPattern.FindStringSubmatch(key); matches != nil {
+		if matches := tlsDomainPattern.FindStringSubmatch(key); matches != nil {
 			idx, _ := strconv.Atoi(matches[1])
 			if domainMap[idx] == nil {
 				domainMap[idx] = &types.Domain{}
@@ -691,18 +730,24 @@ func handleRouterTLS(service internal.Service, prefix string) *dynamic.RouterTLS
 	return tlsConfig
 }
 
-// Helper to get service URL with correct port
-func getServiceURL(service internal.Service, serviceName string, nodeName string) string {
+// getServiceURLs builds the list of backend URLs for a service. Each entry
+// becomes one Server in the load balancer. Precedence (first match wins,
+// returning a single-element slice):
+//  1. Explicit `…server.url` label
+//  2. Explicit `…server.ip` label (combined with port + scheme)
+//  3. Discovered guest-agent IPs (one URL per IP, sorted by address)
+//  4. Hostname fallback `<vmname>.<nodename>:<port>`
+func getServiceURLs(service internal.Service, serviceName string, nodeName string) []string {
 	// Check for direct URL override
 	urlLabel := fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.url", serviceName)
 	if url, exists := service.Config[urlLabel]; exists {
-		return url
+		return []string{url}
 	}
 
 	// Default protocol and port
 	protocol := "http"
 	port := "80"
-	
+
 	// Check for HTTPS protocol setting
 	httpsLabel := fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.scheme", serviceName)
 	if scheme, exists := service.Config[httpsLabel]; exists && scheme == "https" {
@@ -710,7 +755,7 @@ func getServiceURL(service internal.Service, serviceName string, nodeName string
 		// Update default port for HTTPS
 		port = "443"
 	}
-	
+
 	// Look for service-specific port
 	portLabel := fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.port", serviceName)
 	if val, exists := service.Config[portLabel]; exists {
@@ -720,23 +765,29 @@ func getServiceURL(service internal.Service, serviceName string, nodeName string
 	// Look for service-specific ip
 	ipLabel := fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.ip", serviceName)
 	if val, exists := service.Config[ipLabel]; exists {
-		return fmt.Sprintf("%s://%s:%s", protocol, val, port)
+		return []string{fmt.Sprintf("%s://%s:%s", protocol, val, port)}
 	}
-	
-	// Use IP if available, otherwise fall back to hostname
+
+	// Use guest-agent IPs if available, otherwise fall back to hostname.
 	if len(service.IPs) > 0 {
-		// Create a list of server URLs from all IPs
+		urls := make([]string, 0, len(service.IPs))
 		for _, ip := range service.IPs {
 			if ip.Address != "" {
-				return fmt.Sprintf("%s://%s:%s", protocol, ip.Address, port)
+				urls = append(urls, fmt.Sprintf("%s://%s:%s", protocol, ip.Address, port))
 			}
 		}
+		if len(urls) > 0 {
+			// Sort so the emitted load-balancer config is stable across polls
+			// even if the guest agent reorders interfaces.
+			sort.Strings(urls)
+			return urls
+		}
 	}
-	
+
 	// Fall back to hostname
 	url := fmt.Sprintf("%s://%s.%s:%s", protocol, service.Name, nodeName, port)
 	log.Printf("No IPs found, using hostname URL %s for service %s (ID: %d)", url, service.Name, service.ID)
-	return url
+	return []string{url}
 }
 
 // Helper to get router rule
@@ -774,12 +825,16 @@ func stringToBool(s string) (bool, error) {
 	}
 }
 
-// Helper to convert map keys to slice
+// mapKeysToSlice returns the keys of m as a slice in deterministic
+// (lexicographic) order. Sorting matters because callers iterate the result
+// to build router/service configuration; without it, downstream behavior
+// (e.g. which service a router defaults to) can flap between polls.
 func mapKeysToSlice(m map[string]bool) []string {
 	result := make([]string, 0, len(m))
 	for k := range m {
 		result = append(result, k)
 	}
+	sort.Strings(result)
 	return result
 }
 
@@ -841,7 +896,17 @@ func validateConfig(config *Config) error {
 	return nil
 }
 
+// isBoolLabelEnabled returns true when `label` is present in `labels` and its
+// value parses as a Go bool via strconv.ParseBool. This matches Traefik's own
+// Docker provider semantics — accepts "1", "t", "T", "true", "True", "TRUE"
+// (and "false", "0", "f" etc. as false). It intentionally does NOT use the
+// more permissive stringToBool helper, which accepts "yes"/"on"/"off" — those
+// are not recognized by Traefik core.
 func isBoolLabelEnabled(labels map[string]string, label string) bool {
 	val, exists := labels[label]
-	return exists && val == "true"
+	if !exists {
+		return false
+	}
+	b, err := strconv.ParseBool(val)
+	return err == nil && b
 }

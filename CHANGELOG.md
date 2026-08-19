@@ -1,5 +1,28 @@
 # Changelog
 
+## [v0.9.1-multi-node] - 2026-08-18
+
+### Added
+
+- DHCP LXC IP fallback via `inet`/`inet6` when `ip-addresses` is empty (upstream PR #53)
+- Prefer same-named service when binding multiple routers without an explicit `.service` label (upstream PR #55)
+- Parse Traefik labels written as dash bullets in Proxmox notes (upstream PR #54)
+- Extended healthcheck labels: `scheme`, `port`, `followRedirects`, `method` (upstream PR #51)
+- Multi-IP load balancing: each discovered guest IP becomes a backend server
+
+### Fixed
+
+- Router priority no longer hardcoded to `1`; Traefik default ordering is preserved unless an explicit priority label is set
+- Offline Proxmox nodes (`status != online`) are skipped instead of scanned
+- `mapKeysToSlice` now returns keys in sorted order for stable router/service defaults
+- TLS domain regex compiled once at package init
+- `traefik.enable` accepts `strconv.ParseBool` truthy values (`1`, `t`, `true`, …), matching Traefik's Docker provider
+
+### Notes
+
+- Builds on multi-node support from v0.9.0-multi-node
+- Does **not** adopt upstream PR #48's breaking VMID suffix namespacing for explicit router/service names
+
 ## [v0.7.0] - 2024-03-28
 
 ### Added

@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"encoding/json"
 	"testing"
 )
 
@@ -203,4 +204,135 @@ func TestParsedAgentInterfaces_GetIPs(t *testing.T) {
 	if ips[1].Address != "10.0.0.1" {
 		t.Errorf("Expected second IP to be 10.0.0.1, got %s", ips[1].Address)
 	}
-} 
+}
+
+func TestParseCIDR(t *testing.T) {
+	// parseCIDR turns a DHCP inet/inet6 CIDR string into an IP, used to infer
+	// container IPs when the guest agent reports no addresses.
+	tests := []struct {
+		name string
+		cidr string
+		want IP
+	}{
+		{
+			name: "ipv4 with prefix",
+			cidr: "8.8.8.8/24",
+			want: IP{Address: "8.8.8.8", AddressType: "ipv4", Prefix: 24},
+		},
+		{
+			name: "ipv6 with prefix",
+			cidr: "fe80::1/64",
+			want: IP{Address: "fe80::1", AddressType: "ipv6", Prefix: 64},
+		},
+		{
+			name: "address without prefix",
+			cidr: "10.0.0.5",
+			want: IP{Address: "10.0.0.5", AddressType: "ipv4", Prefix: 0},
+		},
+		{
+			name: "invalid prefix is ignored",
+			cidr: "10.0.0.5/notanumber",
+			want: IP{Address: "10.0.0.5", AddressType: "ipv4", Prefix: 0},
+		},
+		{
+			name: "empty string yields zero IP",
+			cidr: "",
+			want: IP{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseCIDR(tt.cidr)
+			if got != tt.want {
+				t.Errorf("parseCIDR(%q) = %+v, want %+v", tt.cidr, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParsedConfig_GetTraefikMap_Bullets(t *testing.T) {
+	// Proxmox notes/descriptions are often written as bullet lists. A leading
+	// dash bullet is trimmed off the key so labels written as dash bullets are
+	// still parsed.
+	tests := []struct {
+		name        string
+		description string
+		want        map[string]string
+	}{
+		{
+			name:        "dash bullets with space",
+			description: "- traefik.enable=true\n- traefik.http.routers.test.rule=Host(`test.example.com`)",
+			want: map[string]string{
+				"traefik.enable":                 "true",
+				"traefik.http.routers.test.rule": "Host(`test.example.com`)",
+			},
+		},
+		{
+			name:        "dash bullet without space",
+			description: "-traefik.enable=true",
+			want: map[string]string{
+				"traefik.enable": "true",
+			},
+		},
+		{
+			// Leading spaces before the dash are trimmed along with it.
+			name:        "indented dash bullet",
+			description: "   -traefik.enable=true",
+			want: map[string]string{
+				"traefik.enable": "true",
+			},
+		},
+		{
+			// Only a dash marks a bullet; other chars are not stripped, so the
+			// label is dropped.
+			name:        "non-dash bullet without space is not parsed",
+			description: "*traefik.enable=true",
+			want:        map[string]string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pc := ParsedConfig{Description: tt.description}
+			m := pc.GetTraefikMap()
+
+			if len(m) != len(tt.want) {
+				t.Fatalf("Expected %d config items, got %d: %v", len(tt.want), len(m), m)
+			}
+			for k, v := range tt.want {
+				if m[k] != v {
+					t.Errorf("Expected %s=%s, got %s", k, v, m[k])
+				}
+			}
+		})
+	}
+}
+
+func TestNodeStatus_JSONUnmarshal(t *testing.T) {
+	tests := []struct {
+		name       string
+		raw        string
+		wantNode   string
+		wantStatus string
+	}{
+		{"online node", `{"node":"pve1","status":"online"}`, "pve1", "online"},
+		{"offline node", `{"node":"pve2","status":"offline"}`, "pve2", "offline"},
+		{"unknown node", `{"node":"pve3","status":"unknown"}`, "pve3", "unknown"},
+		{"missing status", `{"node":"pve4"}`, "pve4", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var ns NodeStatus
+			if err := json.Unmarshal([]byte(tt.raw), &ns); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if ns.Node != tt.wantNode {
+				t.Errorf("Node = %q, want %q", ns.Node, tt.wantNode)
+			}
+			if ns.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q", ns.Status, tt.wantStatus)
+			}
+		})
+	}
+}

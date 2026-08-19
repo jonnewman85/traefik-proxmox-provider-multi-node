@@ -141,6 +141,13 @@ Make sure to save the API token value when it's displayed, as it won't be shown 
 
 The provider looks for Traefik labels in the VM/container notes field. Each line in the Notes field starting with `traefik.` will be treated as a Traefik label.
 
+### Label notes
+
+- Labels may be written as dash bullets in the notes field (e.g. `- traefik.enable=true`)
+- `traefik.enable` accepts Traefik/Docker-style bools: `true`, `True`, `1`, `t` (not `yes`/`on`)
+- When multiple routers and services are defined on one guest, a router without an explicit `.service` label binds to the service with the same name when present
+- All discovered non-loopback IPv4 addresses are added as load-balancer servers (not only the first)
+
 ### Required Labels
 
 - `traefik.enable=true` - Without this label, the VM/container will be ignored
@@ -188,6 +195,10 @@ traefik.http.routers.myapp.tls.options=tlsoptions@file
 traefik.http.services.myservice.loadbalancer.healthcheck.path=/health
 traefik.http.services.myservice.loadbalancer.healthcheck.interval=10s
 traefik.http.services.myservice.loadbalancer.healthcheck.timeout=5s
+traefik.http.services.myservice.loadbalancer.healthcheck.scheme=http
+traefik.http.services.myservice.loadbalancer.healthcheck.port=8088
+traefik.http.services.myservice.loadbalancer.healthcheck.followRedirects=true
+traefik.http.services.myservice.loadbalancer.healthcheck.method=GET
 ```
 
 #### Sticky Sessions

@@ -15,7 +15,8 @@ type ParsedAgentInterfaces struct {
 }
 
 type NodeStatus struct {
-	Node string `json:"node"`
+	Node   string `json:"node"`
+	Status string `json:"status"`
 }
 
 type VirtualMachine struct {
@@ -66,6 +67,8 @@ func (pc *ParsedConfig) GetTraefikMap() map[string]string {
 			continue
 		}
 
+		// Strip markdown/dash bullets from notes (e.g. "- traefik.enable=true").
+		key = strings.Trim(key, "- ")
 		key = strings.Trim(key, "\" ")
 		value = strings.Trim(value, "\" ")
 

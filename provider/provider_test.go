@@ -283,13 +283,13 @@ func TestProviderService(t *testing.T) {
 	}
 }
 
-func TestGetServiceURL(t *testing.T) {
+func TestGetServiceURLs(t *testing.T) {
 	tests := []struct {
-		name        string
-		service     internal.Service
-		serviceName string
-		nodeName    string
-		expectedUrl string
+		name         string
+		service      internal.Service
+		serviceName  string
+		nodeName     string
+		expectedURLs []string
 	}{
 		{
 			name:        "IP set, default port and scheme",
@@ -299,7 +299,7 @@ func TestGetServiceURL(t *testing.T) {
 					"traefik.http.services.service.loadbalancer.server.ip": "1.2.3.4",
 				},
 			},
-			expectedUrl: "http://1.2.3.4:80",
+			expectedURLs: []string{"http://1.2.3.4:80"},
 		},
 		{
 			name:        "IP and scheme set, default port (http)",
@@ -310,7 +310,7 @@ func TestGetServiceURL(t *testing.T) {
 					"traefik.http.services.service.loadbalancer.server.scheme": "http",
 				},
 			},
-			expectedUrl: "http://1.2.3.4:80",
+			expectedURLs: []string{"http://1.2.3.4:80"},
 		},
 		{
 			name:        "IP and scheme set, default port (https)",
@@ -321,7 +321,7 @@ func TestGetServiceURL(t *testing.T) {
 					"traefik.http.services.service.loadbalancer.server.scheme": "https",
 				},
 			},
-			expectedUrl: "https://1.2.3.4:443",
+			expectedURLs: []string{"https://1.2.3.4:443"},
 		},
 		{
 			name:        "IP, port and scheme set",
@@ -333,7 +333,7 @@ func TestGetServiceURL(t *testing.T) {
 					"traefik.http.services.service.loadbalancer.server.port":   "8080",
 				},
 			},
-			expectedUrl: "https://1.2.3.4:8080",
+			expectedURLs: []string{"https://1.2.3.4:8080"},
 		},
 		{
 			name:        "URL is set",
@@ -343,7 +343,7 @@ func TestGetServiceURL(t *testing.T) {
 					"traefik.http.services.service.loadbalancer.server.url": "http://test.com:1234",
 				},
 			},
-			expectedUrl: "http://test.com:1234",
+			expectedURLs: []string{"http://test.com:1234"},
 		},
 		{
 			name:        "URL overrides other settings",
@@ -356,15 +356,32 @@ func TestGetServiceURL(t *testing.T) {
 					"traefik.http.services.service.loadbalancer.server.port":   "8080",
 				},
 			},
-			expectedUrl: "http://test.com:1234",
+			expectedURLs: []string{"http://test.com:1234"},
+		},
+		{
+			name:        "Multiple discovered IPs fan out sorted",
+			serviceName: "service",
+			service: internal.Service{
+				Config: map[string]string{},
+				IPs: []internal.IP{
+					{Address: "10.0.0.2", AddressType: "ipv4"},
+					{Address: "10.0.0.1", AddressType: "ipv4"},
+				},
+			},
+			expectedURLs: []string{"http://10.0.0.1:80", "http://10.0.0.2:80"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			url := getServiceURL(tt.service, tt.serviceName, tt.nodeName)
-			if url != tt.expectedUrl {
-				t.Errorf("Expected URL to be %s, got %s", tt.expectedUrl, url)
+			urls := getServiceURLs(tt.service, tt.serviceName, tt.nodeName)
+			if len(urls) != len(tt.expectedURLs) {
+				t.Fatalf("len(urls) = %d, want %d. Got %v", len(urls), len(tt.expectedURLs), urls)
+			}
+			for i, want := range tt.expectedURLs {
+				if urls[i] != want {
+					t.Errorf("urls[%d] = %q, want %q", i, urls[i], want)
+				}
 			}
 		})
 	}
@@ -552,6 +569,95 @@ func keys[V any](m map[string]V) []string {
 		result = append(result, k)
 	}
 	return result
+}
+
+func TestGenerateConfiguration_MultipleRouters(t *testing.T) {
+	// A single guest defining multiple routers and multiple services should
+	// wire each router to the service whose name matches the router, rather than
+	// pointing every router at the first service.
+	service := internal.Service{
+		ID:   100,
+		Name: "multi",
+		Config: map[string]string{
+			"traefik.enable":                                     "true",
+			"traefik.http.routers.blog.rule":                     "Host(`blog.example.com`)",
+			"traefik.http.routers.shop.rule":                     "Host(`shop.example.com`)",
+			"traefik.http.services.blog.loadbalancer.server.url": "http://23.45.67.89:8080",
+			"traefik.http.services.shop.loadbalancer.server.url": "http://23.45.67.90:8080",
+		},
+	}
+	clusterMaps := []clusterServiceMap{
+		{
+			clusterName: "default",
+			services:    map[string][]internal.Service{"node1": {service}},
+		},
+	}
+
+	config := generateConfiguration(clusterMaps, false)
+
+	if len(config.HTTP.Routers) != 2 {
+		t.Fatalf("Expected 2 routers, got %d: %v", len(config.HTTP.Routers), config.HTTP.Routers)
+	}
+
+	for _, name := range []string{"blog", "shop"} {
+		router, exists := config.HTTP.Routers[name]
+		if !exists {
+			t.Errorf("Expected router %q to exist", name)
+			continue
+		}
+		if router.Service != name {
+			t.Errorf("Router %q should target service %q, got %q", name, name, router.Service)
+		}
+		if router.Priority != 0 {
+			t.Errorf("Router %q Priority = %d, want 0 (unset default)", name, router.Priority)
+		}
+	}
+}
+
+func TestMapKeysToSlice_Sorted(t *testing.T) {
+	in := map[string]bool{"charlie": true, "alpha": true, "bravo": true, "delta": true}
+	got := mapKeysToSlice(in)
+	want := []string{"alpha", "bravo", "charlie", "delta"}
+	if len(got) != len(want) {
+		t.Fatalf("len = %d, want %d", len(got), len(want))
+	}
+	for i, v := range want {
+		if got[i] != v {
+			t.Errorf("got[%d] = %q, want %q (full got = %v)", i, got[i], v, got)
+		}
+	}
+}
+
+func TestIsBoolLabelEnabled(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels map[string]string
+		want   bool
+	}{
+		{"missing key", map[string]string{}, false},
+		{"empty value", map[string]string{"traefik.enable": ""}, false},
+		{"true literal", map[string]string{"traefik.enable": "true"}, true},
+		{"True mixed case", map[string]string{"traefik.enable": "True"}, true},
+		{"TRUE upper", map[string]string{"traefik.enable": "TRUE"}, true},
+		{"t shorthand", map[string]string{"traefik.enable": "t"}, true},
+		{"T shorthand", map[string]string{"traefik.enable": "T"}, true},
+		{"1 numeric", map[string]string{"traefik.enable": "1"}, true},
+		{"false literal", map[string]string{"traefik.enable": "false"}, false},
+		{"0 numeric", map[string]string{"traefik.enable": "0"}, false},
+		{"f shorthand", map[string]string{"traefik.enable": "f"}, false},
+		// Intentionally NOT supported (Traefik core doesn't accept these):
+		{"yes rejected", map[string]string{"traefik.enable": "yes"}, false},
+		{"on rejected", map[string]string{"traefik.enable": "on"}, false},
+		{"junk rejected", map[string]string{"traefik.enable": "blarg"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isBoolLabelEnabled(tt.labels, "traefik.enable")
+			if got != tt.want {
+				t.Errorf("isBoolLabelEnabled(%v) = %v, want %v", tt.labels, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestHandleRouterTLS_ArrayDomains(t *testing.T) {
